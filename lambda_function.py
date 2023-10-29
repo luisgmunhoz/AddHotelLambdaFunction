@@ -28,10 +28,11 @@ def parse_form(headers, body, boundary):
 
     logger.info("parse headers: %s", headers)
     content_type = headers.get("Content-Type")
-    if content_type is None:
+    if not content_type:
+        content_type = headers.get("content-type")
+    if not content_type:
         logger.warning("Your header misses Content-Type")
         raise ValueError("Your header misses Content-Type")
-
     if boundary is None:
         logger.warning("Your header misses boundary parameter")
         raise ValueError("Your header misses boundary parameter")
@@ -49,6 +50,29 @@ def parse_form(headers, body, boundary):
         headers=new_headers, input_stream=body, on_field=on_field, on_file=on_file
     )
     return fields, files
+
+
+def decode_token(id_token):
+    try:
+        token = jwt.decode(id_token, options={"verify_signature": False})
+    except jwt.exceptions.DecodeError:
+        raise ValueError("Invalid token")
+    return token
+
+
+def verify_admin_group(token):
+    group = token.get("cognito:groups")
+    if group is None or "Admin" not in group:
+        raise ValueError("You are not a member of the Admin group")
+
+
+def upload_to_s3(bucket_name, file_name, file_object):
+    s3_client = boto3.client("s3", region_name=os.getenv("AWS_REGION"))
+    s3_client.put_object(Bucket=bucket_name, Key=file_name, Body=file_object.read())
+
+
+def store_hotel_record(table, hotel):
+    table.put_item(Item=hotel)
 
 
 def handler(event, context):
@@ -82,23 +106,15 @@ def handler(event, context):
     id_token = fields.get("idToken")
     logger.info(f"attempting to decode token {id_token}")
     try:
-        token = jwt.decode(id_token, options={"verify_signature": False})
-    except jwt.exceptions.DecodeError:
+        token = decode_token(id_token)
+        verify_admin_group(token)
+    except ValueError as e:
         return {
             "statusCode": 401,
             "headers": response_headers,
-            "body": json.dumps({"Error": "Invalid token"}),
+            "body": json.dumps({"Error": str(e)}),
         }
-    group = token.get("cognito:groups")
 
-    logger.info(group)
-
-    if group is None or "Admin" not in group:
-        return {
-            "statusCode": 401,
-            "headers": response_headers,
-            "body": json.dumps({"Error": "You are not a member of the Admin group"}),
-        }
     logger.info("Token verified, reading rest of the data and preparing upload")
     hotel_name = fields.get("hotelName")
     hotel_rating = fields.get("hotelRating")
@@ -110,17 +126,14 @@ def handler(event, context):
     file.file_object.seek(0)
 
     bucket_name = os.getenv("BUCKET_NAME")
-    region = os.getenv("AWS_REGION")
-    s3_client = boto3.client("s3", region_name=region)
-    dynamoDb = boto3.resource("dynamodb", region_name=region)
-    table = dynamoDb.Table(os.getenv("TABLE_NAME"))
+    table = boto3.resource("dynamodb", region_name=os.getenv("AWS_REGION")).Table(
+        os.getenv("TABLE_NAME")
+    )
 
     logger.info(bucket_name)
     try:
         # Upload the image to S3
-        s3_client.put_object(
-            Bucket=bucket_name, Key=file_name, Body=file.file_object.read()
-        )
+        upload_to_s3(bucket_name, file_name, file.file_object)
 
         hotel = {
             "userId": user_id,
@@ -133,11 +146,7 @@ def handler(event, context):
         }
 
         # Store the hotel record in DynamoDb
-        table.put_item(Item=hotel)
-
-        # sns_topic_arn = os.getenv("hotelCreationTopicArn")
-        # sns_client = boto3.client("sns")
-        # sns_client.publish(TopicArn=sns_topic_arn, Message=json.dumps(hotel))
+        store_hotel_record(table, hotel)
 
     except Exception as e:
         logger.error(traceback.format_exc())
@@ -157,6 +166,8 @@ def handler(event, context):
 def extract_boundary(headers):
     logger.info(f"headers in extract_boundary: {headers}")
     content_type = headers.get("Content-Type")
+    if not content_type:
+        content_type = headers.get("content-type")
     boundary_start = content_type.find("boundary=")
     if boundary_start != -1:
         boundary_end = content_type.find(";", boundary_start)
