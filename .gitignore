@@ -1,0 +1,4 @@
+.env
+dist
+layer.zip
+__pycache__
