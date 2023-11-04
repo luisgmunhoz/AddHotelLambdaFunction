@@ -105,6 +105,19 @@ def extract_boundary(headers: Dict[str, Any]) -> Optional[str]:
     return result
 
 
+def publish_to_sns(hotel: Dict[str, Any]) -> None:
+    sns_topic_arn = os.getenv("hotelCreationTopicArn")
+    if sns_topic_arn is None:
+        raise ValueError("Missing SNS topic ARN")
+
+    sns_client = boto3.client("sns")
+    try:
+        sns_client.publish(TopicArn=sns_topic_arn, Message=json.dumps(hotel))
+    except Exception as e:
+        logger.error(f"Failed to publish to SNS: {str(e)}")
+        raise e
+
+
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     response_headers = {
         "Access-Control-Allow-Headers": "*",
@@ -188,6 +201,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
         # Store the hotel record in DynamoDb
         store_hotel_record(table, hotel)
+
+        publish_to_sns(hotel)
 
     except Exception as e:
         logger.error(traceback.format_exc())
