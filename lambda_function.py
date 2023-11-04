@@ -56,12 +56,13 @@ def verify_admin_group(token: Dict[str, Any]) -> None:
         raise ValueError("You are not a member of the Admin group")
 
 
-def upload_to_s3(bucket_name: str, file_name: str, decoded_data: Any) -> None:
-    s3_client = boto3.client("s3", region_name=os.getenv("AWS_REGION"))
+def upload_to_s3(
+    s3_client: Any, bucket_name: str, file_name: str, file_content: bytes
+) -> None:
     s3_client.put_object(
         Bucket=bucket_name,
         Key=file_name,
-        Body=decoded_data,
+        Body=file_content,
         ContentType="image/png",
     )
 
@@ -161,19 +162,19 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     file_name = file.file_name.decode()
     file.file_object.seek(0)
 
-    decoded_data = base64.b64decode(file.file_object.read())
+    file_content = file.file_object.read()
     bucket_name = os.getenv("BUCKET_NAME")
     if bucket_name is None:
         return error_response(500, "Missing bucket name", response_headers)
 
-    upload_to_s3(bucket_name, file_name, decoded_data)
+    s3_client = boto3.client("s3", region_name=os.getenv("AWS_REGION"))
     table = boto3.resource("dynamodb", region_name=os.getenv("AWS_REGION")).Table(
         os.getenv("TABLE_NAME")
     )
 
     try:
         # Upload the image to S3
-        upload_to_s3(bucket_name, file_name, decoded_data)
+        upload_to_s3(s3_client, bucket_name, file_name, file_content)
 
         hotel = {
             "userId": user_id,
