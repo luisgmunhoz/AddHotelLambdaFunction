@@ -19,12 +19,12 @@ def parse_form(
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     fields, files = {}, {}
 
-    def on_field(field):
+    def on_field(field: Any) -> None:
         key = field.field_name.decode()
         value = field.value.decode()
         fields[key] = value
 
-    def on_file(file):
+    def on_file(file: Any) -> None:
         key = file.field_name.decode()
         files[key] = file
 
@@ -46,7 +46,7 @@ def parse_form(
 def decode_token(id_token: str) -> Dict[str, Any]:
     try:
         token = jwt.decode(id_token, options={"verify_signature": False})
-    except jwt.exceptions.DecodeError as e:
+    except jwt.DecodeError as e:
         raise ValueError(f"Invalid token: {str(e)}")
     return token
 
@@ -96,11 +96,12 @@ def extract_boundary(headers: Dict[str, Any]) -> Optional[str]:
         return None
 
     boundary = content_type.split("boundary=")[1].split(";")[0].strip()
-    return (
+    result: str = (
         boundary.strip('"')
         if boundary.startswith('"') and boundary.endswith('"')
         else boundary
     )
+    return result
 
 
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -128,7 +129,10 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         return error_response(400, str(e), response_headers)
 
     try:
-        token = decode_token(fields.get("idToken"))
+        id_token = fields.get("idToken")
+        if id_token is None:
+            return error_response(401, "Missing id token", response_headers)
+        token = decode_token(id_token)
         verify_admin_group(token)
     except ValueError as e:
         return error_response(401, str(e), response_headers)
@@ -138,16 +142,31 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     hotel_rating = fields.get("hotelRating")
     hotel_city = fields.get("hotelCity")
     hotel_price = fields.get("hotelPrice")
+
+    if (
+        hotel_price is None
+        or hotel_rating is None
+        or hotel_name is None
+        or hotel_city is None
+    ):
+        return error_response(
+            400,
+            "Missing hotel price or rating or name or city in the request",
+            response_headers,
+        )
     user_id = fields.get("userId")
     file = files.get("photo")
+    if file is None:
+        return error_response(400, "Missing photo in the request", response_headers)
     file_name = file.file_name.decode()
     file.file_object.seek(0)
 
-    file = files.get("photo")
-    file_name = file.file_name.decode()
-    file.file_object.seek(0)
     decoded_data = base64.b64decode(file.file_object.read())
     bucket_name = os.getenv("BUCKET_NAME")
+    if bucket_name is None:
+        return error_response(500, "Missing bucket name", response_headers)
+
+    upload_to_s3(bucket_name, file_name, decoded_data)
     table = boto3.resource("dynamodb", region_name=os.getenv("AWS_REGION")).Table(
         os.getenv("TABLE_NAME")
     )
