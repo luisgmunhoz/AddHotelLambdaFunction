@@ -7,14 +7,16 @@ import logging
 import base64
 import jwt
 import io
-from typing import Dict, Any
+from typing import Dict, Any, Optional, Tuple
 import multipart as python_multipart
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 
-def parse_form(headers, body, boundary):
+def parse_form(
+    headers: Dict[str, Any], body: io.BytesIO, boundary: str
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     fields, files = {}, {}
 
     def on_field(field):
@@ -26,25 +28,14 @@ def parse_form(headers, body, boundary):
         key = file.field_name.decode()
         files[key] = file
 
-    logger.info("parse headers: %s", headers)
-    content_type = headers.get("Content-Type")
-    if not content_type:
-        content_type = headers.get("content-type")
-    if not content_type:
-        logger.warning("Your header misses Content-Type")
-        raise ValueError("Your header misses Content-Type")
-    if boundary is None:
-        logger.warning("Your header misses boundary parameter")
-        raise ValueError("Your header misses boundary parameter")
+    content_type = headers.get("Content-Type", headers.get("content-type"))
+    if not content_type or boundary is None:
+        raise ValueError("Your header misses Content-Type or boundary parameter")
 
-    # Extract the multipart/form-data part and remove whitespace
     content_type_parts = content_type.split(";")
-    content_type_part = content_type_parts[0].strip()
-    boundary_part = f"boundary={boundary}"
-
-    # Update the headers with the modified Content-Type value
-    new_headers: Dict[str, Any] = {}
-    new_headers["Content-Type"] = f"{content_type_part};{boundary_part}"
+    new_headers = {
+        "Content-Type": f"{content_type_parts[0].strip()};boundary={boundary}"
+    }
 
     python_multipart.parse_form(
         headers=new_headers, input_stream=body, on_field=on_field, on_file=on_file
@@ -52,30 +43,67 @@ def parse_form(headers, body, boundary):
     return fields, files
 
 
-def decode_token(id_token):
+def decode_token(id_token: str) -> Dict[str, Any]:
     try:
         token = jwt.decode(id_token, options={"verify_signature": False})
-    except jwt.exceptions.DecodeError:
-        raise ValueError("Invalid token")
+    except jwt.exceptions.DecodeError as e:
+        raise ValueError(f"Invalid token: {str(e)}")
     return token
 
 
-def verify_admin_group(token):
-    group = token.get("cognito:groups")
-    if group is None or "Admin" not in group:
+def verify_admin_group(token: Dict[str, Any]) -> None:
+    if "Admin" not in token.get("cognito:groups", []):
         raise ValueError("You are not a member of the Admin group")
 
 
-def upload_to_s3(bucket_name, file_name, file_object):
+def upload_to_s3(bucket_name: str, file_name: str, decoded_data: Any) -> None:
     s3_client = boto3.client("s3", region_name=os.getenv("AWS_REGION"))
-    s3_client.put_object(Bucket=bucket_name, Key=file_name, Body=file_object.read())
+    s3_client.put_object(
+        Bucket=bucket_name,
+        Key=file_name,
+        Body=decoded_data,
+        ContentType="image/png",
+    )
 
 
-def store_hotel_record(table, hotel):
+def store_hotel_record(table: Any, hotel: Dict[str, Any]) -> None:
+    """
+    Store a hotel record in a DynamoDB table.
+
+    Parameters:
+
+    table (Any):
+    The DynamoDB table to store the record in.
+
+    hotel (Dict[str, Any]): The hotel record to store.
+    """
     table.put_item(Item=hotel)
 
 
-def handler(event, context):
+def error_response(
+    status_code: int, error_message: str, headers: Dict[str, Any]
+) -> Dict[str, Any]:
+    return {
+        "statusCode": status_code,
+        "headers": headers,
+        "body": json.dumps({"Error": error_message}),
+    }
+
+
+def extract_boundary(headers: Dict[str, Any]) -> Optional[str]:
+    content_type = headers.get("Content-Type", headers.get("content-type", None))
+    if not content_type or "boundary=" not in content_type:
+        return None
+
+    boundary = content_type.split("boundary=")[1].split(";")[0].strip()
+    return (
+        boundary.strip('"')
+        if boundary.startswith('"') and boundary.endswith('"')
+        else boundary
+    )
+
+
+def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     response_headers = {
         "Access-Control-Allow-Headers": "*",
         "Access-Control-Allow-Origin": "*",
@@ -83,37 +111,27 @@ def handler(event, context):
     }
 
     request_headers = event["headers"]
-    logger.info(f"request_headers: {request_headers}")
-    body = event["body"]
-    if bool(event.get("isBase64Encoded")):
-        body = base64.b64decode(body)
-    else:
-        body = body.encode("utf-8")
+    body = event.get("body")
+    if body is None:
+        return error_response(400, "Missing body in the request", response_headers)
 
+    body = (
+        base64.b64decode(body) if event.get("isBase64Encoded") else body.encode("utf-8")
+    )
     boundary = extract_boundary(request_headers)
-    logger.info(f"boundary: {boundary}")
     if boundary is None:
-        raise ValueError("Unable to extract boundary")
+        return error_response(400, "Unable to extract boundary", response_headers)
+
     try:
         fields, files = parse_form(request_headers, io.BytesIO(body), boundary)
     except ValueError as e:
-        return {
-            "statusCode": 400,
-            "headers": response_headers,
-            "body": json.dumps({"Error": str(e)}),
-        }
+        return error_response(400, str(e), response_headers)
 
-    id_token = fields.get("idToken")
-    logger.info(f"attempting to decode token {id_token}")
     try:
-        token = decode_token(id_token)
+        token = decode_token(fields.get("idToken"))
         verify_admin_group(token)
     except ValueError as e:
-        return {
-            "statusCode": 401,
-            "headers": response_headers,
-            "body": json.dumps({"Error": str(e)}),
-        }
+        return error_response(401, str(e), response_headers)
 
     logger.info("Token verified, reading rest of the data and preparing upload")
     hotel_name = fields.get("hotelName")
@@ -125,15 +143,18 @@ def handler(event, context):
     file_name = file.file_name.decode()
     file.file_object.seek(0)
 
+    file = files.get("photo")
+    file_name = file.file_name.decode()
+    file.file_object.seek(0)
+    decoded_data = base64.b64decode(file.file_object.read())
     bucket_name = os.getenv("BUCKET_NAME")
     table = boto3.resource("dynamodb", region_name=os.getenv("AWS_REGION")).Table(
         os.getenv("TABLE_NAME")
     )
 
-    logger.info(bucket_name)
     try:
         # Upload the image to S3
-        upload_to_s3(bucket_name, file_name, file.file_object)
+        upload_to_s3(bucket_name, file_name, decoded_data)
 
         hotel = {
             "userId": user_id,
@@ -161,24 +182,3 @@ def handler(event, context):
         "headers": response_headers,
         "body": json.dumps({"message": "OK"}),
     }
-
-
-def extract_boundary(headers):
-    logger.info(f"headers in extract_boundary: {headers}")
-    content_type = headers.get("Content-Type")
-    if not content_type:
-        content_type = headers.get("content-type")
-    boundary_start = content_type.find("boundary=")
-    if boundary_start != -1:
-        boundary_end = content_type.find(";", boundary_start)
-        if boundary_end == -1:
-            boundary_end = len(content_type)
-        boundary = content_type[boundary_start + len("boundary=") : boundary_end].strip()
-
-        # Check if the boundary is enclosed in quotes and remove them if present
-        if boundary.startswith('"') and boundary.endswith('"'):
-            boundary = boundary[1:-1]
-
-        return boundary
-
-    return None
